@@ -92,13 +92,25 @@ func handler(ctx context.Context, req WorkerRequest) (*WorkerResponse, error) {
 		}
 
 		entry := zipasm.FileEntry{Name: f.Key, Size: f.Size}
+		headerOffset := buf.Len()
 		buf.Write(zipasm.LocalFileHeader(entry))
+
+		// Pre-grow buffer to avoid reallocation during streaming
+		buf.Grow(int(f.Size))
 
 		crc, _, err := zipasm.CRC32Stream(&buf, out.Body)
 		out.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", f.Key, err)
 		}
+
+		// Patch CRC32 into local file header at offset+14
+		b := buf.Bytes()
+		b[headerOffset+14] = byte(crc)
+		b[headerOffset+15] = byte(crc >> 8)
+		b[headerOffset+16] = byte(crc >> 16)
+		b[headerOffset+17] = byte(crc >> 24)
+
 		crc32s = append(crc32s, CRC32Entry{Name: f.Key, CRC32: crc})
 
 		if buf.Len() >= partSizeThreshold {

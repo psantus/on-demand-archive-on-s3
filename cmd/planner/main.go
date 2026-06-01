@@ -101,7 +101,7 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 	// Compute total data size (including headers)
 	var totalDataSize uint64
 	for _, e := range plan.Entries {
-		totalDataSize += e.Size + 30 + uint64(len(e.Name))
+		totalDataSize += zipasm.LocalFileHeaderSize(e.Name) + e.Size
 	}
 	targetPerWorker := totalDataSize / uint64(n)
 	if targetPerWorker < 5*1024*1024 {
@@ -114,7 +114,7 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 
 	for i, e := range plan.Entries {
 		currentFiles = append(currentFiles, FileInfo{Key: e.Name, Size: e.Size, Offset: e.Offset})
-		currentSize += e.Size + 30 + uint64(len(e.Name))
+		currentSize += e.Size + zipasm.LocalFileHeaderSize(e.Name)
 
 		isLast := i == total-1
 		reachedTarget := currentSize >= targetPerWorker

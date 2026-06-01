@@ -17,13 +17,13 @@ func TestPlanOffsets(t *testing.T) {
 	if p.Entries[0].Offset != 0 {
 		t.Fatalf("entry 0 offset = %d, want 0", p.Entries[0].Offset)
 	}
-	// Second entry at 30 + 5("a.txt") + 10(data) = 45
-	want := uint64(30 + 5 + 10)
+	// Second entry at LocalFileHeaderSize("a.txt") + 10(data)
+	want := LocalFileHeaderSize("a.txt") + 10
 	if p.Entries[1].Offset != want {
 		t.Fatalf("entry 1 offset = %d, want %d", p.Entries[1].Offset, want)
 	}
-	// CDOffset = 45 + 30 + 6("bb.txt") + 20 = 101
-	wantCD := want + 30 + 6 + 20
+	// CDOffset = want + LocalFileHeaderSize("bb.txt") + 20
+	wantCD := want + LocalFileHeaderSize("bb.txt") + 20
 	if p.CDOffset != wantCD {
 		t.Fatalf("CDOffset = %d, want %d", p.CDOffset, wantCD)
 	}
