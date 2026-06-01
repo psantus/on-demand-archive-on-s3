@@ -1,0 +1,16 @@
+# Binaries
+bootstrap
+*.zip
+
+# Go
+vendor/
+
+# CDK
+infra/node_modules/
+infra/cdk.out/
+
+# Lambda build artifacts
+infra/lambda/
+
+# OS
+.DS_Store
