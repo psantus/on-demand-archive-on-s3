@@ -121,39 +121,43 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 	smallIdx := 0
 	copyIdx := 0 // index into bigs (largest first)
 	for copyIdx < len(bigs) && smallIdx < len(smalls) {
-		var streamFiles []FileRef
 		var partDataSize uint64
+		startSmall := smallIdx
 
-		// Accumulate small files until we reach 5MB (minus LOC of the copy file)
+		// Accumulate small files until we reach 5MB
 		for smallIdx < len(smalls) {
 			s := smalls[smallIdx]
 			entrySize := zipasm.LocalFileHeaderSize(s.key) + s.size
 			if partDataSize+entrySize >= minPartSize {
-				break // enough already
+				break
 			}
-			ref := addEntry(s.key, s.size)
-			streamFiles = append(streamFiles, ref)
 			partDataSize += entrySize
 			smallIdx++
 		}
-
-		// If we still haven't reached 5MB with smalls alone, add more smalls
 		for smallIdx < len(smalls) && partDataSize < minPartSize {
 			s := smalls[smallIdx]
-			ref := addEntry(s.key, s.size)
-			streamFiles = append(streamFiles, ref)
 			partDataSize += zipasm.LocalFileHeaderSize(s.key) + s.size
 			smallIdx++
 		}
 
-		// The copy file: add its LOC to the UploadPart, data goes via UploadPartCopy
+		// Check if partDataSize + LOC of copy file reaches 5MB
 		big := bigs[copyIdx]
+		totalPartSize := partDataSize + zipasm.LocalFileHeaderSize(big.key)
+		if totalPartSize < minPartSize {
+			// Not enough data — revert smalls, they'll go to "remaining smalls"
+			smallIdx = startSmall
+			break
+		}
+
+		// Commit: add entries to zip layout
+		var streamFiles []FileRef
+		for i := startSmall; i < smallIdx; i++ {
+			s := smalls[i]
+			ref := addEntry(s.key, s.size)
+			streamFiles = append(streamFiles, ref)
+		}
+
 		copyRef := addEntry(big.key, big.size)
-		// The partDataSize includes the LOC of the copy file (but not its data)
-		// Adjust: we added full entry (LOC+data) to offset, but UploadPart only has LOC
-		// Actually addEntry already advanced offset past LOC+data, which is correct for zip layout
-		// The UploadPart contains: streamFiles data + copyFile LOC
-		// The UploadPartCopy contains: copyFile data
 
 		duos = append(duos, Duo{
 			StreamFiles: streamFiles,
@@ -162,27 +166,27 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 		copyIdx++
 	}
 
-	// Remaining small files (no big file to pair with) — just upload as a part
-	if smallIdx < len(smalls) {
-		var streamFiles []FileRef
-		for smallIdx < len(smalls) {
-			s := smalls[smallIdx]
-			ref := addEntry(s.key, s.size)
-			streamFiles = append(streamFiles, ref)
-			smallIdx++
-		}
-		duos = append(duos, Duo{StreamFiles: streamFiles})
+	// Collect remaining small files — they'll be prepended to the first Phase 2 duo
+	var remainingSmalls []FileRef
+	for smallIdx < len(smalls) {
+		s := smalls[smallIdx]
+		ref := addEntry(s.key, s.size)
+		remainingSmalls = append(remainingSmalls, ref)
+		smallIdx++
 	}
 
 	// Phase 2: when out of small files, pair remaining bigs:
 	// stream smallest remaining big + LOC of largest remaining big → UploadPartCopy largest
+	firstPhase2 := true
 	for copyIdx < len(bigs) {
 		remaining := len(bigs) - copyIdx
 		if remaining == 1 {
-			// Last big file: just stream it
+			// Last big file: just stream it (prepend remaining smalls if any)
 			big := bigs[copyIdx]
 			ref := addEntry(big.key, big.size)
-			duos = append(duos, Duo{StreamFiles: []FileRef{ref}})
+			streamFiles := append(remainingSmalls, ref)
+			remainingSmalls = nil
+			duos = append(duos, Duo{StreamFiles: streamFiles})
 			copyIdx++
 		} else {
 			// Pair: stream smallest remaining (end of slice), copy largest remaining (copyIdx)
@@ -193,12 +197,23 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 			copyBig := bigs[copyIdx]
 			copyRef := addEntry(copyBig.key, copyBig.size)
 
+			streamFiles := []FileRef{streamRef}
+			if firstPhase2 {
+				streamFiles = append(remainingSmalls, streamRef)
+				remainingSmalls = nil
+				firstPhase2 = false
+			}
 			duos = append(duos, Duo{
-				StreamFiles: []FileRef{streamRef},
+				StreamFiles: streamFiles,
 				CopyFile:    &copyRef,
 			})
 			copyIdx++
 		}
+	}
+
+	// If there are still remaining smalls (no bigs at all), add as standalone
+	if len(remainingSmalls) > 0 {
+		duos = append(duos, Duo{StreamFiles: remainingSmalls})
 	}
 
 	// Compute zip plan for CD
@@ -230,19 +245,28 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 	}
 
 	var assignments []Assignment
+	partNumberCursor := int32(1)
 	for i := 0; i < len(duos); i += duosPerWorker {
 		end := i + duosPerWorker
 		if end > len(duos) {
 			end = len(duos)
 		}
+		batch := duos[i:end]
 		assignments = append(assignments, Assignment{
 			UploadID:     uploadID,
 			OutputBucket: req.OutputBucket,
 			OutputKey:    req.OutputKey,
 			SourceBucket: req.SourceBucket,
-			Duos:         duos[i:end],
-			PartNumber:   int32(len(assignments)*200 + 1), // 200 part numbers per worker (each duo uses 2)
+			Duos:         batch,
+			PartNumber:   partNumberCursor,
 		})
+		// Each duo uses at most 2 part numbers (UploadPart + UploadPartCopy)
+		for _, d := range batch {
+			partNumberCursor++
+			if d.CopyFile != nil {
+				partNumberCursor++
+			}
+		}
 	}
 
 	// Build CD info
