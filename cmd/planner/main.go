@@ -18,7 +18,6 @@ type PlanRequest struct {
 	SourcePrefix string `json:"sourcePrefix"`
 	OutputBucket string `json:"outputBucket"`
 	OutputKey    string `json:"outputKey"`
-	WorkerCount  int    `json:"workerCount"`
 }
 
 // A Duo is: one UploadPart (small files + LOC of copied file) followed by one UploadPartCopy (big file data)
@@ -234,38 +233,21 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 	}
 	uploadID := *mpu.UploadId
 
-	// Divide duos into assignments for workers
-	n := req.WorkerCount
-	if n <= 0 {
-		n = 100
-	}
-	duosPerWorker := len(duos) / n
-	if duosPerWorker < 1 {
-		duosPerWorker = 1
-	}
-
+	// One assignment per duo
 	var assignments []Assignment
 	partNumberCursor := int32(1)
-	for i := 0; i < len(duos); i += duosPerWorker {
-		end := i + duosPerWorker
-		if end > len(duos) {
-			end = len(duos)
-		}
-		batch := duos[i:end]
+	for _, d := range duos {
 		assignments = append(assignments, Assignment{
 			UploadID:     uploadID,
 			OutputBucket: req.OutputBucket,
 			OutputKey:    req.OutputKey,
 			SourceBucket: req.SourceBucket,
-			Duos:         batch,
+			Duos:         []Duo{d},
 			PartNumber:   partNumberCursor,
 		})
-		// Each duo uses at most 2 part numbers (UploadPart + UploadPartCopy)
-		for _, d := range batch {
+		partNumberCursor++
+		if d.CopyFile != nil {
 			partNumberCursor++
-			if d.CopyFile != nil {
-				partNumberCursor++
-			}
 		}
 	}
 

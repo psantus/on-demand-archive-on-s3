@@ -66,7 +66,7 @@ export class MegaZipperStack extends cdk.Stack {
 
     const mapState = new sfn.Map(this, 'FanOutWorkers', {
       itemsPath: '$.assignments',
-      maxConcurrency: 5,
+      maxConcurrency: 150,
       resultPath: '$.workerResults',
     });
     mapState.itemProcessor(workerTask);
