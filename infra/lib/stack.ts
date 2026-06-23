@@ -15,7 +15,7 @@ export class MegaZipperStack extends cdk.Stack {
     // Shared S3 policy
     const s3Policy = new iam.PolicyStatement({
       actions: ['s3:GetObject', 's3:PutObject', 's3:ListBucket',
-                's3:CreateMultipartUpload', 's3:UploadPart',
+                's3:CreateMultipartUpload', 's3:UploadPart', 's3:UploadPartCopy',
                 's3:CompleteMultipartUpload', 's3:AbortMultipartUpload'],
       resources: ['*'],
     });
@@ -64,12 +64,15 @@ export class MegaZipperStack extends cdk.Stack {
       outputPath: '$.Payload',
     });
 
-    const mapState = new sfn.Map(this, 'FanOutWorkers', {
+    const mapState = new sfn.DistributedMap(this, 'FanOutWorkers', {
       itemsPath: '$.assignments',
-      maxConcurrency: 150,
+      maxConcurrency: 1000,
       resultPath: '$.workerResults',
     });
-    mapState.itemProcessor(workerTask);
+    mapState.itemProcessor(workerTask, {
+      mode: sfn.ProcessorMode.DISTRIBUTED,
+      executionType: sfn.ProcessorType.EXPRESS,
+    });
 
     const finalizeTask = new tasks.LambdaInvoke(this, 'Finalize', {
       lambdaFunction: finalizer,
