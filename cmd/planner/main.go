@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 
@@ -44,9 +46,13 @@ type Assignment struct {
 }
 
 type PlanResponse struct {
-	UploadID    string       `json:"uploadId"`
-	Assignments []Assignment `json:"assignments"`
-	CDInfo      CDInfo       `json:"cdInfo"`
+	UploadID          string `json:"uploadId"`
+	OutputBucket      string `json:"outputBucket"`
+	OutputKey         string `json:"outputKey"`
+	AssignmentsBucket string `json:"assignmentsBucket"`
+	AssignmentsKey    string `json:"assignmentsKey"`
+	CDInfoBucket      string `json:"cdInfoBucket"`
+	CDInfoKey         string `json:"cdInfoKey"`
 }
 
 type CDInfo struct {
@@ -233,34 +239,61 @@ func handler(ctx context.Context, req PlanRequest) (*PlanResponse, error) {
 	}
 	uploadID := *mpu.UploadId
 
-	// One assignment per duo
+	// One assignment per duo — write as JSON array to S3
+	assignmentsKey := "_plan/assignments.json"
 	var assignments []Assignment
 	partNumberCursor := int32(1)
 	for _, d := range duos {
-		assignments = append(assignments, Assignment{
+		a := Assignment{
 			UploadID:     uploadID,
 			OutputBucket: req.OutputBucket,
 			OutputKey:    req.OutputKey,
 			SourceBucket: req.SourceBucket,
 			Duos:         []Duo{d},
 			PartNumber:   partNumberCursor,
-		})
+		}
 		partNumberCursor++
 		if d.CopyFile != nil {
 			partNumberCursor++
 		}
+		assignments = append(assignments, a)
 	}
 
-	// Build CD info
+	assignmentsBytes, _ := json.Marshal(assignments)
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &req.OutputBucket,
+		Key:    &assignmentsKey,
+		Body:   bytes.NewReader(assignmentsBytes),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("write assignments: %w", err)
+	}
+
+	// Write CDInfo to S3
+	cdInfoKey := "_plan/cdinfo.json"
 	cdEntries := make([]CDEntry, len(zipEntries))
 	for i, e := range zipEntries {
 		cdEntries[i] = CDEntry{Name: e.Name, Size: e.Size, Offset: e.Offset}
 	}
+	cdInfo := CDInfo{Entries: cdEntries, CDOffset: cdOffset}
+	cdInfoBytes, _ := json.Marshal(cdInfo)
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &req.OutputBucket,
+		Key:    &cdInfoKey,
+		Body:   bytes.NewReader(cdInfoBytes),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("write cdinfo: %w", err)
+	}
 
 	return &PlanResponse{
-		UploadID:    uploadID,
-		Assignments: assignments,
-		CDInfo:      CDInfo{Entries: cdEntries, CDOffset: cdOffset},
+		UploadID:          uploadID,
+		OutputBucket:      req.OutputBucket,
+		OutputKey:         req.OutputKey,
+		AssignmentsBucket: req.OutputBucket,
+		AssignmentsKey:    assignmentsKey,
+		CDInfoBucket:      req.OutputBucket,
+		CDInfoKey:         cdInfoKey,
 	}, nil
 }
 

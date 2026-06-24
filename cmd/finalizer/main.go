@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -35,16 +37,16 @@ type PartInfo struct {
 }
 
 type WorkerResult struct {
-	Parts  []PartInfo   `json:"parts"`
-	CRC32s []CRC32Entry `json:"crc32s"`
+	Parts []PartInfo `json:"parts"`
 }
 
 type FinalizeRequest struct {
 	UploadID      string         `json:"uploadId"`
 	OutputBucket  string         `json:"outputBucket"`
 	OutputKey     string         `json:"outputKey"`
+	CDInfoBucket  string         `json:"cdInfoBucket"`
+	CDInfoKey     string         `json:"cdInfoKey"`
 	WorkerResults []WorkerResult `json:"workerResults"`
-	CDInfo        CDInfo         `json:"cdInfo"`
 }
 
 type FinalizeResponse struct {
@@ -60,17 +62,55 @@ func handler(ctx context.Context, req FinalizeRequest) (*FinalizeResponse, error
 	}
 	client := s3.NewFromConfig(cfg)
 
-	// Build CRC32 lookup
+	// Read CDInfo from S3
+	cdObj, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &req.CDInfoBucket,
+		Key:    &req.CDInfoKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get cdinfo: %w", err)
+	}
+	cdInfoBytes, _ := io.ReadAll(cdObj.Body)
+	cdObj.Body.Close()
+
+	var cdInfo CDInfo
+	if err := json.Unmarshal(cdInfoBytes, &cdInfo); err != nil {
+		return nil, fmt.Errorf("parse cdinfo: %w", err)
+	}
+
+	// Read CRC32s from S3 (written by workers)
 	crcMap := make(map[string]uint32)
-	for _, wr := range req.WorkerResults {
-		for _, c := range wr.CRC32s {
-			crcMap[c.Name] = c.CRC32
+	crcPrefix := "_plan/crc32s/"
+	crcPaginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: &req.OutputBucket,
+		Prefix: &crcPrefix,
+	})
+	for crcPaginator.HasMorePages() {
+		page, err := crcPaginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list crc32s: %w", err)
+		}
+		for _, obj := range page.Contents {
+			crcObj, err := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: &req.OutputBucket,
+				Key:    obj.Key,
+			})
+			if err != nil {
+				continue
+			}
+			crcBytes, _ := io.ReadAll(crcObj.Body)
+			crcObj.Body.Close()
+			var entries []CRC32Entry
+			json.Unmarshal(crcBytes, &entries)
+			for _, e := range entries {
+				crcMap[e.Name] = e.CRC32
+			}
 		}
 	}
 
 	// Build entries with real CRC32 values
-	entries := make([]zipasm.FileEntry, len(req.CDInfo.Entries))
-	for i, e := range req.CDInfo.Entries {
+	entries := make([]zipasm.FileEntry, len(cdInfo.Entries))
+	for i, e := range cdInfo.Entries {
 		entries[i] = zipasm.FileEntry{
 			Name:   e.Name,
 			Size:   e.Size,
@@ -81,10 +121,10 @@ func handler(ctx context.Context, req FinalizeRequest) (*FinalizeResponse, error
 
 	// Build central directory + EOCD
 	cd := zipasm.CentralDirectory(entries)
-	eocd := zipasm.EOCD(req.CDInfo.CDOffset, uint64(len(cd)), uint16(len(entries)))
+	eocd := zipasm.EOCD(cdInfo.CDOffset, uint64(len(cd)), uint16(len(entries)))
 	tail := append(cd, eocd...)
 
-	// Collect all parts from workers, find max part number
+	// Collect all parts from workers
 	var allParts []types.CompletedPart
 	maxPart := int32(0)
 	for _, wr := range req.WorkerResults {
@@ -98,7 +138,7 @@ func handler(ctx context.Context, req FinalizeRequest) (*FinalizeResponse, error
 		}
 	}
 
-	// Upload CD as next part
+	// Upload CD as final part
 	cdPartNumber := maxPart + 1
 	body := bytes.NewReader(tail)
 	upOut, err := client.UploadPart(ctx, &s3.UploadPartInput{
@@ -115,16 +155,13 @@ func handler(ctx context.Context, req FinalizeRequest) (*FinalizeResponse, error
 
 	cdEtag := *upOut.ETag
 	allParts = append(allParts, types.CompletedPart{PartNumber: &cdPartNumber, ETag: &cdEtag})
-
 	sort.Slice(allParts, func(i, j int) bool { return *allParts[i].PartNumber < *allParts[j].PartNumber })
 
 	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:   &req.OutputBucket,
 		Key:      &req.OutputKey,
 		UploadId: &req.UploadID,
-		MultipartUpload: &types.CompletedMultipartUpload{
-			Parts: allParts,
-		},
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: allParts},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("complete multipart: %w", err)
@@ -133,7 +170,7 @@ func handler(ctx context.Context, req FinalizeRequest) (*FinalizeResponse, error
 	return &FinalizeResponse{
 		OutputBucket: req.OutputBucket,
 		OutputKey:    req.OutputKey,
-		TotalSize:    req.CDInfo.CDOffset + uint64(len(tail)),
+		TotalSize:    cdInfo.CDOffset + uint64(len(tail)),
 	}, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -45,7 +46,6 @@ type PartInfo struct {
 
 type WorkerResponse struct {
 	Parts  []PartInfo   `json:"parts"`
-	CRC32s []CRC32Entry `json:"crc32s"`
 }
 
 func handler(ctx context.Context, req WorkerRequest) (*WorkerResponse, error) {
@@ -151,7 +151,19 @@ func handler(ctx context.Context, req WorkerRequest) (*WorkerResponse, error) {
 		}
 	}
 
-	return &WorkerResponse{Parts: parts, CRC32s: crc32s}, nil
+	// Write CRC32s to S3 for the finalizer
+	crcKey := fmt.Sprintf("_plan/crc32s/%d.json", req.PartNumber)
+	crcBytes, _ := json.Marshal(crc32s)
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &req.OutputBucket,
+		Key:    &crcKey,
+		Body:   bytes.NewReader(crcBytes),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("write crc32s: %w", err)
+	}
+
+	return &WorkerResponse{Parts: parts}, nil
 }
 
 // decodeCRC32 decodes S3's base64-encoded CRC32 to uint32 (big-endian 4 bytes)
