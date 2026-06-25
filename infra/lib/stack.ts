@@ -49,6 +49,21 @@ export class MegaZipperStack extends cdk.Stack {
     });
     finalizer.addToRolePolicy(s3Policy);
 
+    // Orchestrator Lambda (standalone, no Step Functions needed)
+    const orchestrator = new lambda.Function(this, 'Orchestrator', {
+      runtime: lambda.Runtime.PROVIDED_AL2023,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'bootstrap',
+      code: lambda.Code.fromAsset(path.join(lambdaDir, 'orchestrator.zip')),
+      memorySize: 1024,
+      timeout: cdk.Duration.minutes(15),
+    });
+    orchestrator.addToRolePolicy(s3Policy);
+    orchestrator.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['lambda:InvokeFunction'],
+      resources: [worker.functionArn],
+    }));
+
     // Plan step
     const planTask = new tasks.LambdaInvoke(this, 'Plan', {
       lambdaFunction: planner,

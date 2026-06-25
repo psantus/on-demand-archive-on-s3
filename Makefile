@@ -1,6 +1,6 @@
 .PHONY: build deploy synth clean
 
-LAMBDAS = planner worker finalizer
+LAMBDAS = planner worker finalizer orchestrator
 
 build:
 	@for fn in $(LAMBDAS); do \
