@@ -46,6 +46,7 @@ type PartInfo struct {
 
 type WorkerResponse struct {
 	Parts  []PartInfo   `json:"parts"`
+	CRC32s []CRC32Entry `json:"crc32s"`
 }
 
 func handler(ctx context.Context, req WorkerRequest) (*WorkerResponse, error) {
@@ -163,7 +164,7 @@ func handler(ctx context.Context, req WorkerRequest) (*WorkerResponse, error) {
 		return nil, fmt.Errorf("write crc32s: %w", err)
 	}
 
-	return &WorkerResponse{Parts: parts}, nil
+	return &WorkerResponse{Parts: parts, CRC32s: crc32s}, nil
 }
 
 // decodeCRC32 decodes S3's base64-encoded CRC32 to uint32 (big-endian 4 bytes)

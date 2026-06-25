@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"sort"
 	"sync"
 
@@ -142,10 +141,14 @@ func handler(ctx context.Context, req Request) (*Response, error) {
 
 	// === INVOKE WORKERS IN PARALLEL ===
 	type workerResult struct {
-		Parts  []struct {
+		Parts []struct {
 			PartNumber int32  `json:"partNumber"`
 			ETag       string `json:"etag"`
 		} `json:"parts"`
+		CRC32s []struct {
+			Name  string `json:"name"`
+			CRC32 uint32 `json:"crc32"`
+		} `json:"crc32s"`
 	}
 
 	results := make([]workerResult, len(assignments))
@@ -184,51 +187,13 @@ func handler(ctx context.Context, req Request) (*Response, error) {
 		return nil, firstErr
 	}
 
-	// === FINALIZE PHASE ===
-	// Read CRC32s from S3
-	crcPrefix := "_plan/crc32s/"
-	var crcKeys []string
-	crcPag := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{
-		Bucket: &req.OutputBucket,
-		Prefix: &crcPrefix,
-	})
-	for crcPag.HasMorePages() {
-		page, _ := crcPag.NextPage(ctx)
-		for _, obj := range page.Contents {
-			crcKeys = append(crcKeys, *obj.Key)
+	// Build CRC32 map from worker responses (no S3 round-trip needed in orchestrator mode)
+	crcMap := make(map[string]uint32)
+	for _, r := range results {
+		for _, c := range r.CRC32s {
+			crcMap[c.Name] = c.CRC32
 		}
 	}
-
-	type CRC32Entry struct {
-		Name  string `json:"name"`
-		CRC32 uint32 `json:"crc32"`
-	}
-	crcMap := make(map[string]uint32)
-	var crcWg sync.WaitGroup
-	crcSem := make(chan struct{}, 50)
-	var mu sync.Mutex
-	for _, key := range crcKeys {
-		crcWg.Add(1)
-		go func(k string) {
-			defer crcWg.Done()
-			crcSem <- struct{}{}
-			defer func() { <-crcSem }()
-			obj, err := s3Client.GetObject(ctx, &s3.GetObjectInput{Bucket: &req.OutputBucket, Key: &k})
-			if err != nil {
-				return
-			}
-			b, _ := io.ReadAll(obj.Body)
-			obj.Body.Close()
-			var entries []CRC32Entry
-			json.Unmarshal(b, &entries)
-			mu.Lock()
-			for _, e := range entries {
-				crcMap[e.Name] = e.CRC32
-			}
-			mu.Unlock()
-		}(key)
-	}
-	crcWg.Wait()
 
 	// Build CD
 	entries := make([]zipasm.FileEntry, len(plan.Entries))
