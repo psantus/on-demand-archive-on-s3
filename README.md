@@ -98,16 +98,16 @@ aws stepfunctions start-execution \
 
 ## Performance
 
-Tested with 3000 × 5MB files (normal distribution, mean=5MB, stddev=1MB):
+Tested with files following a normal distribution (mean=5MB, stddev=1MB):
 
-| Approach | Time | Notes |
-|----------|------|-------|
-| Single Lambda, Rust streaming (Jérémie Gen1) | 212s | Bandwidth-bound |
-| Single Lambda, Rust + UploadPartCopy (Gen2) | 106s | 50% less bandwidth |
-| Step Functions + Distributed Map | 41s | Orchestration overhead |
-| **Orchestrator Lambda** | **11s** | Direct invoke, no overhead |
+| Approach | 3000 files (15GB) | 15000 files (73GB) |
+|----------|-------------------|--------------------|
+| Single Lambda, Rust streaming (Jérémie Gen1) | 212s | — |
+| Single Lambda, Rust + UploadPartCopy (Gen2) | 106s | — |
+| Step Functions + Distributed Map | 41s | — |
+| **Orchestrator Lambda** | **6s** | **20s** |
 
-Worker stats (orchestrator mode):
+Worker stats (orchestrator mode, 3000 files):
 - Max memory: 85 MB (allocated 3008MB)
 - Average duration: 516ms
 - Max duration: 1035ms
