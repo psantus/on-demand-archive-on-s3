@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -78,9 +79,9 @@ func handler(ctx context.Context, req FinalizeRequest) (*FinalizeResponse, error
 		return nil, fmt.Errorf("parse cdinfo: %w", err)
 	}
 
-	// Read CRC32s from S3 (written by workers)
-	crcMap := make(map[string]uint32)
+	// Read CRC32s from S3 in parallel (written by workers)
 	crcPrefix := "_plan/crc32s/"
+	var keys []string
 	crcPaginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: &req.OutputBucket,
 		Prefix: &crcPrefix,
@@ -91,20 +92,42 @@ func handler(ctx context.Context, req FinalizeRequest) (*FinalizeResponse, error
 			return nil, fmt.Errorf("list crc32s: %w", err)
 		}
 		for _, obj := range page.Contents {
+			keys = append(keys, *obj.Key)
+		}
+	}
+
+	type crcResult struct {
+		entries []CRC32Entry
+	}
+	results := make([]crcResult, len(keys))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 50)
+	for i, key := range keys {
+		wg.Add(1)
+		go func(idx int, k string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			crcObj, err := client.GetObject(ctx, &s3.GetObjectInput{
 				Bucket: &req.OutputBucket,
-				Key:    obj.Key,
+				Key:    &k,
 			})
 			if err != nil {
-				continue
+				return
 			}
 			crcBytes, _ := io.ReadAll(crcObj.Body)
 			crcObj.Body.Close()
 			var entries []CRC32Entry
 			json.Unmarshal(crcBytes, &entries)
-			for _, e := range entries {
-				crcMap[e.Name] = e.CRC32
-			}
+			results[idx] = crcResult{entries: entries}
+		}(i, key)
+	}
+	wg.Wait()
+
+	crcMap := make(map[string]uint32)
+	for _, r := range results {
+		for _, e := range r.entries {
+			crcMap[e.Name] = e.CRC32
 		}
 	}
 
