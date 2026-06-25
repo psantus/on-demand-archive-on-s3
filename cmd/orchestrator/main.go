@@ -121,7 +121,24 @@ func handler(ctx context.Context, req Request) (*Response, error) {
 			flushBatch()
 		}
 	}
-	flushBatch()
+	// If remaining batch is too small, merge into the last assignment
+	if batchSize > 0 && batchSize < minPartSize && len(assignments) > 0 {
+		// Pop last assignment, decode, merge batch into its streamFiles, re-encode
+		var lastA map[string]interface{}
+		json.Unmarshal(assignments[len(assignments)-1], &lastA)
+		duos := lastA["duos"].([]interface{})
+		duo := duos[0].(map[string]interface{})
+		existing := duo["streamFiles"].([]interface{})
+		for _, b := range batch {
+			existing = append(existing, b)
+		}
+		duo["streamFiles"] = existing
+		lastA["duos"] = []interface{}{duo}
+		assignments[len(assignments)-1], _ = json.Marshal(lastA)
+		batch = nil
+	} else {
+		flushBatch()
+	}
 
 	// === INVOKE WORKERS IN PARALLEL ===
 	type workerResult struct {
