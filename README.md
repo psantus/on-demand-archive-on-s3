@@ -2,13 +2,13 @@
 
 Parallel zip assembly on AWS Lambda. Creates a single ZIP64 archive from thousands of S3 objects in seconds using `UploadPartCopy` and concurrent Lambda workers.
 
-**Benchmark: 3000 × 5MB files (15GB) → single zip in 11 seconds.**
+**Benchmark: 3000 × 5MB files (15GB) → single zip in 6 seconds.**
 
 ## Architecture
 
 Two modes: **Orchestrator** (fastest, recommended) and **Step Functions** (observable, retryable).
 
-### Orchestrator Lambda (11s for 15GB)
+### Orchestrator Lambda (6s for 15GB)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
