@@ -1,46 +1,64 @@
-# Lambda Mega Zipper
+# On-Demand Archive on S3
 
-Parallel zip assembly on AWS Lambda using Step Functions fan-out. Creates a single zip archive from thousands of S3 objects in seconds by distributing work across concurrent Lambda workers.
+Parallel zip assembly on AWS Lambda. Creates a single ZIP64 archive from thousands of S3 objects in seconds using `UploadPartCopy` and concurrent Lambda workers.
+
+**Benchmark: 3000 × 5MB files (15GB) → single zip in 11 seconds.**
 
 ## Architecture
 
+Two modes: **Orchestrator** (fastest, recommended) and **Step Functions** (observable, retryable).
+
+### Orchestrator Lambda (11s for 15GB)
+
 ```
-┌─────────────┐     ┌──────────────────────────────────────┐     ┌───────────────┐
-│   Planner   │────▶│   Step Functions Distributed Map     │────▶│   Finalizer   │
-│   Lambda    │     │   (N concurrent Worker Lambdas)      │     │   Lambda      │
-└─────────────┘     └──────────────────────────────────────┘     └───────────────┘
-       │                          │ │ │                                   │
-       │ CreateMultipartUpload    │ │ │ UploadPart (parallel)            │ UploadPart (CD)
-       ▼                          ▼ ▼ ▼                                   │ CompleteMultipartUpload
-┌──────────────────────────────────────────────────────────────────────────▼──┐
-│                              S3 Output Bucket                               │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    Orchestrator Lambda                        │
+│                                                              │
+│  1. List files, compute zip layout                           │
+│  2. CreateMultipartUpload                                    │
+│  3. Invoke N workers in parallel (goroutines + Lambda SDK)   │
+│  4. Collect parts, read CRC32s from S3                       │
+│  5. Build central directory, CompleteMultipartUpload          │
+└──────┬──────────────────────────────────────────────┬────────┘
+       │ Invoke (sync)                                │
+       ▼                                              ▼
+┌──────────────┐                              ┌──────────────┐
+│  Worker 1    │  ...                         │  Worker N    │
+│  UploadPart  │                              │  UploadPart  │
+│  + PartCopy  │                              │  + PartCopy  │
+└──────────────┘                              └──────────────┘
 ```
 
-**How it works:**
+### Step Functions (41s for 15GB)
 
-1. **Planner** lists all source files, computes deterministic zip byte offsets (STORE mode = no compression), initiates an S3 multipart upload, and divides files into N worker batches.
+```
+Planner → Distributed Map (N Workers) → Finalizer
+```
 
-2. **Workers** (up to 1000 concurrent) each download their assigned files, construct zip local file headers + raw data, compute CRC32 on the fly, and upload their chunk as an S3 multipart part.
+Used when you need observability, retries, or audit trails.
 
-3. **Finalizer** collects CRC32 values from all workers, builds the central directory + EOCD record, uploads it as the final part, and completes the multipart upload.
+## How it works
 
-The key insight: zip STORE mode has deterministic entry offsets (30 + len(filename) + filesize per entry), so workers can write their portions independently without coordination.
+1. **Plan**: List source files, compute deterministic ZIP64 byte offsets (STORE mode), group into "Duos"
+2. **Workers**: For each Duo:
+   - Stream small files (<5MB): download → write LOC + data → `UploadPart`
+   - Big files (≥5MB): `HeadObject` for CRC32, write LOC → `UploadPartCopy` (server-side, no download)
+3. **Finalize**: Build central directory with CRC32s, upload as final part, `CompleteMultipartUpload`
+
+**Key insight**: `UploadPartCopy` tells S3 to copy file data directly into the multipart upload without transiting through Lambda. Workers use ~85MB memory regardless of file sizes.
 
 ## Prerequisites
 
 - Go 1.21+
 - Node.js 18+ (for CDK)
 - AWS CLI configured
-- AWS CDK CLI (`npm install -g aws-cdk`)
+- Lambda concurrency ≥100 in target region
 
 ## Build
 
 ```bash
 make build
 ```
-
-This cross-compiles all three Lambda binaries for `linux/arm64` and packages them as zip files in `infra/lambda/`.
 
 ## Deploy
 
@@ -51,63 +69,64 @@ make deploy
 
 ## Usage
 
-Start an execution via AWS CLI:
+### Orchestrator (recommended)
+
+```bash
+aws lambda invoke --function-name <ORCHESTRATOR_FUNCTION> \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "sourceBucket": "my-bucket",
+    "sourcePrefix": "photos/",
+    "outputBucket": "my-bucket",
+    "outputKey": "archives/photos.zip",
+    "workerFunction": "<WORKER_FUNCTION_NAME>"
+  }' result.json
+```
+
+### Step Functions
 
 ```bash
 aws stepfunctions start-execution \
   --state-machine-arn <STATE_MACHINE_ARN> \
   --input '{
-    "sourceBucket": "my-source-bucket",
-    "sourcePrefix": "path/to/files/",
-    "outputBucket": "my-output-bucket",
-    "outputKey": "output/archive.zip",
-    "workerCount": 100
+    "sourceBucket": "my-bucket",
+    "sourcePrefix": "photos/",
+    "outputBucket": "my-bucket",
+    "outputKey": "archives/photos.zip"
   }'
 ```
 
-## Integration Test
+## Performance
 
-```bash
-./scripts/integration_test.sh <source-bucket> <output-bucket> <state-machine-arn> [file-count] [file-size-mb]
-```
+Tested with 3000 × 5MB files (normal distribution, mean=5MB, stddev=1MB):
 
-Example with 10 × 1MB files:
-```bash
-./scripts/integration_test.sh my-bucket my-bucket arn:aws:states:us-east-1:123456789:stateMachine:MegaZipperSM 10 1
-```
+| Approach | Time | Notes |
+|----------|------|-------|
+| Single Lambda, Rust streaming (Jérémie Gen1) | 212s | Bandwidth-bound |
+| Single Lambda, Rust + UploadPartCopy (Gen2) | 106s | 50% less bandwidth |
+| Step Functions + Distributed Map | 41s | Orchestration overhead |
+| **Orchestrator Lambda** | **11s** | Direct invoke, no overhead |
 
-## Tuning Parameters
-
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `workerCount` | 100 | Number of parallel workers. More = faster but hits Lambda concurrency limits |
-| Worker memory | 3008 MB | Higher = more CPU + network bandwidth (2 vCPUs at 3008MB) |
-| Worker timeout | 5 min | Each worker handles ~150MB at default settings |
-| Map MaxConcurrency | 1000 | Step Functions limit per Map state |
-| Download concurrency | 8 | Goroutines per worker for S3 GETs |
-
-## Performance Estimates
-
-For 3000 × 5MB files (15GB total):
-
-| Workers | Data/Worker | Expected Wall-Clock |
-|---------|-------------|---------------------|
-| 100 | ~150MB (30 files) | ~20-30s |
-| 200 | ~75MB (15 files) | ~12-18s |
-| 500 | ~30MB (6 files) | ~8-12s |
-
-Bottlenecks: Lambda cold starts (~200ms for Go on ARM64), S3 GET throughput per worker, Step Functions Map state overhead.
+Worker stats (orchestrator mode):
+- Max memory: 85 MB (allocated 3008MB)
+- Average duration: 516ms
+- Max duration: 1035ms
 
 ## Project Structure
 
 ```
 ├── cmd/
-│   ├── planner/     # Plan phase Lambda
-│   ├── worker/      # Worker Lambda (fan-out)
-│   └── finalizer/   # Finalize phase Lambda
+│   ├── orchestrator/  # All-in-one: plan + invoke workers + finalize
+│   ├── planner/       # Plan phase (Step Functions mode)
+│   ├── worker/        # Worker: UploadPart + UploadPartCopy
+│   └── finalizer/     # Finalize (Step Functions mode)
 ├── pkg/
-│   └── zipasm/      # Zip STORE mode offset calculator & header builder
-├── infra/           # CDK stack (TypeScript)
-├── scripts/         # Integration test
+│   └── zipasm/        # ZIP64 STORE mode offset calculator & header builder
+├── infra/             # CDK stack (TypeScript)
+├── scripts/           # Integration test
 └── Makefile
 ```
+
+## Credits
+
+Inspired by [Jérémie Rodon's article](https://rustysl.com/en/blog/s3-on-demand-archive) and [Fitz's UploadPartCopy idea](https://github.com/FigmentEngine/demo-s3-archiving).
